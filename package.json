@@ -1,0 +1,30 @@
+﻿{
+    "name":  "cryptoearlytokenapp",
+    "version":  "1.0.0",
+    "description":  "",
+    "main":  "index.js",
+    "scripts":  {
+                    "dev":  "next dev --no-turbo",
+                    "build":  "next build",
+                    "start":  "next start",
+                    "lint":  "next lint"
+                },
+    "keywords":  [
+
+                 ],
+    "author":  "",
+    "license":  "ISC",
+    "dependencies":  {
+                         "autoprefixer":  "^10.4.21",
+                         "lucide-react":  "^0.544.0",
+                         "next":  "^14.2.33",
+                         "postcss":  "^8.5.6",
+                         "react":  "^18.3.1",
+                         "react-dom":  "^18.3.1",
+                         "tailwindcss":  "^3.4.14"
+                     },
+    "devDependencies":  {
+                            "eslint":  "^8.57.0",
+                            "eslint-config-next":  "^15.5.4"
+                        }
+}
