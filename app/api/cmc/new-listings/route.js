@@ -1,6 +1,11 @@
 ﻿const CMC_URL = 'https://pro-api.coinmarketcap.com/v1/cryptocurrency/listings/latest';
+const CMC_MARKET_PAIRS_URL = 'https://pro-api.coinmarketcap.com/v1/cryptocurrency/market-pairs/latest';
 const PUSHSHIFT_URL = 'https://api.pushshift.io/reddit/comment/search';
 const MAX_SENTIMENT_TOKENS = 25; // stay well under Pushshift rate guidance
+const MAX_EXCHANGE_TOKENS = 20; // limit exchange lookups to avoid rate issues
+
+const COINGECKO_SEARCH_URL = 'https://api.coingecko.com/api/v3/search';
+const COINGECKO_TICKERS_URL = 'https://api.coingecko.com/api/v3/coins';
 
 const positiveWords = new Set([
   'bull', 'bullish', 'rocket', 'moon', 'moonshot', 'gain', 'gains', 'pump', 'strong', 'undervalued',
@@ -233,6 +238,344 @@ async function fetchRedditMetrics(symbol, token) {
   }
 }
 
+async function fetchCmcMarketPairs(tokenId, apiKey) {
+  if (!tokenId) {
+    return {
+      available: false,
+      reason: 'missing-id',
+      message: 'Token ID missing for exchange lookup',
+      exchanges: [],
+      source: 'coinmarketcap'
+    };
+  }
+
+  if (!apiKey) {
+    return {
+      available: false,
+      reason: 'missing-api-key',
+      message: 'CMC API key not configured for exchange lookup',
+      exchanges: [],
+      source: 'coinmarketcap'
+    };
+  }
+
+  const url = new URL(CMC_MARKET_PAIRS_URL);
+  url.searchParams.set('id', String(tokenId));
+  url.searchParams.set('limit', '20');
+  url.searchParams.set('convert', 'USD');
+  url.searchParams.set('interval', '24h');
+
+  try {
+    const res = await fetch(url.toString(), {
+      headers: {
+        'X-CMC_PRO_API_KEY': apiKey,
+        Accept: 'application/json'
+      },
+      cache: 'no-store'
+    });
+
+    if (res.status === 401 || res.status === 403) {
+      return {
+        available: false,
+        reason: 'unauthorized',
+        message: 'CMC API key unauthorized for market pairs endpoint',
+        exchanges: [],
+        source: 'coinmarketcap'
+      };
+    }
+
+    if (res.status === 429) {
+      return {
+        available: false,
+        reason: 'rate-limited',
+        message: 'CMC market pairs rate limit hit. Try again shortly.',
+        exchanges: [],
+        source: 'coinmarketcap'
+      };
+    }
+
+    if (!res.ok) {
+      const text = await res.text();
+      return {
+        available: false,
+        reason: 'http-error',
+        message: `CMC market pairs ${res.status}: ${text || 'Unknown error'}`,
+        exchanges: [],
+        source: 'coinmarketcap'
+      };
+    }
+
+    const payload = await res.json();
+    const pairs = Array.isArray(payload?.data?.market_pairs) ? payload.data.market_pairs : [];
+
+    const seen = new Set();
+    const exchanges = [];
+
+    pairs.forEach((pair) => {
+      const name = pair?.exchange?.name || pair?.market_pair_exchange?.name;
+      if (!name) return;
+
+      const key = name.toLowerCase();
+      if (seen.has(key)) return;
+      seen.add(key);
+
+      const volume = Number(pair?.quote?.USD?.volume_24h ?? pair?.quote?.USD?.volume_24h_unreported ?? 0);
+      exchanges.push({
+        name,
+        category: pair?.category || null,
+        volume24h: Number.isFinite(volume) ? volume : null
+      });
+    });
+
+    if (!exchanges.length) {
+      return {
+        available: false,
+        reason: 'no-exchanges',
+        message: 'No exchange listings reported yet',
+        exchanges: [],
+        source: 'coinmarketcap'
+      };
+    }
+
+    exchanges.sort((a, b) => (b.volume24h ?? 0) - (a.volume24h ?? 0));
+    const topExchanges = exchanges.slice(0, 8).map(({ name, category, volume24h }) => ({
+      name,
+      category: category || null,
+      volume24h
+    }));
+
+    return {
+      available: true,
+      source: 'coinmarketcap',
+      exchanges: topExchanges
+    };
+  } catch (error) {
+    return {
+      available: false,
+      reason: 'network-error',
+      message: error instanceof Error ? error.message : 'Unknown exchange lookup error',
+      exchanges: [],
+      source: 'coinmarketcap'
+    };
+  }
+}
+
+function scoreCoingeckoCandidate(token, candidate) {
+  if (!candidate) return 0;
+
+  const tokenSymbol = (token?.symbol || '').toLowerCase();
+  const tokenSlug = (token?.slug || '').toLowerCase();
+  const tokenName = (token?.name || '').toLowerCase();
+  const candidateSymbol = (candidate.symbol || '').toLowerCase();
+  const candidateId = (candidate.id || '').toLowerCase();
+  const candidateName = (candidate.name || '').toLowerCase();
+
+  let score = 0;
+  if (tokenSymbol && candidateSymbol && tokenSymbol === candidateSymbol) score += 3;
+  if (tokenSlug && candidateId && tokenSlug === candidateId) score += 2;
+  if (tokenSlug && candidateId && candidateId.includes(tokenSlug)) score += 1;
+  if (tokenSymbol && candidateSymbol && candidateSymbol.includes(tokenSymbol)) score += 0.5;
+  if (tokenName && candidateName && tokenName === candidateName) score += 1.5;
+  if (tokenName && candidateName && candidateName.includes(tokenName)) score += 0.5;
+  return score;
+}
+
+async function fetchCoingeckoMarketPairs(token) {
+  const symbol = (token?.symbol || '').trim();
+  const name = (token?.name || '').trim();
+  const slug = (token?.slug || '').trim();
+  const searchTerms = [symbol, slug?.replace(/-/g, ' '), name].filter(Boolean);
+
+  if (!searchTerms.length) {
+    return {
+      available: false,
+      reason: 'fallback-missing-identifiers',
+      message: 'CoinGecko lookup requires symbol or name',
+      exchanges: [],
+      source: 'coingecko'
+    };
+  }
+
+  let coins = [];
+  let lastErrorMessage = null;
+
+  for (const term of searchTerms) {
+    try {
+      const searchUrl = new URL(COINGECKO_SEARCH_URL);
+      searchUrl.searchParams.set('query', term);
+      const res = await fetch(searchUrl.toString(), {
+        headers: { Accept: 'application/json' },
+        cache: 'no-store'
+      });
+
+      if (res.status === 429) {
+        return {
+          available: false,
+          reason: 'fallback-rate-limited',
+          message: 'CoinGecko rate limit hit. Try again shortly.',
+          exchanges: [],
+          source: 'coingecko'
+        };
+      }
+
+      if (!res.ok) {
+        lastErrorMessage = `CoinGecko search ${res.status}`;
+        continue;
+      }
+
+      const payload = await res.json();
+      coins = Array.isArray(payload?.coins) ? payload.coins : [];
+
+      if (coins.length) {
+        break;
+      }
+    } catch (error) {
+      lastErrorMessage = error instanceof Error ? error.message : 'Unknown CoinGecko search error';
+    }
+  }
+
+  if (!coins.length) {
+    return {
+      available: false,
+      reason: 'fallback-no-match',
+      message: lastErrorMessage || 'No matching asset found on CoinGecko',
+      exchanges: [],
+      source: 'coingecko'
+    };
+  }
+
+  const ranked = coins
+    .map((candidate) => ({
+      candidate,
+      score: scoreCoingeckoCandidate(token, candidate)
+    }))
+    .sort((a, b) => b.score - a.score);
+
+  const bestMatch = ranked.find((entry) => entry.score > 0)?.candidate || ranked[0]?.candidate;
+
+  if (!bestMatch?.id) {
+    return {
+      available: false,
+      reason: 'fallback-no-match',
+      message: 'Unable to resolve CoinGecko asset identifier',
+      exchanges: [],
+      source: 'coingecko'
+    };
+  }
+
+  try {
+    const tickersUrl = `${COINGECKO_TICKERS_URL}/${bestMatch.id}/tickers?include_exchange_logo=false`;
+    const res = await fetch(tickersUrl, {
+      headers: { Accept: 'application/json' },
+      cache: 'no-store'
+    });
+
+    if (res.status === 429) {
+      return {
+        available: false,
+        reason: 'fallback-rate-limited',
+        message: 'CoinGecko rate limit hit. Try again shortly.',
+        exchanges: [],
+        source: 'coingecko'
+      };
+    }
+
+    if (!res.ok) {
+      const text = await res.text();
+      return {
+        available: false,
+        reason: 'fallback-http-error',
+        message: `CoinGecko tickers ${res.status}: ${text || 'Unknown error'}`,
+        exchanges: [],
+        source: 'coingecko'
+      };
+    }
+
+    const payload = await res.json();
+    const tickers = Array.isArray(payload?.tickers) ? payload.tickers : [];
+
+    const seen = new Set();
+    const exchanges = [];
+
+    tickers.forEach((ticker) => {
+      const name = ticker?.market?.name;
+      if (!name) return;
+
+      const key = name.toLowerCase();
+      if (seen.has(key)) return;
+      seen.add(key);
+
+      const volume = Number(ticker?.converted_volume?.usd ?? ticker?.volume ?? 0);
+      const category = ticker?.market?.identifier?.includes('dex')
+        ? 'DEX'
+        : ticker?.market?.type
+          ? String(ticker.market.type).toUpperCase()
+          : null;
+
+      exchanges.push({
+        name,
+        category,
+        volume24h: Number.isFinite(volume) ? volume : null
+      });
+    });
+
+    if (!exchanges.length) {
+      return {
+        available: false,
+        reason: 'fallback-no-exchanges',
+        message: 'No exchange listings reported via CoinGecko',
+        exchanges: [],
+        source: 'coingecko'
+      };
+    }
+
+    exchanges.sort((a, b) => (b.volume24h ?? 0) - (a.volume24h ?? 0));
+    const topExchanges = exchanges.slice(0, 8);
+
+    return {
+      available: true,
+      source: 'coingecko',
+      exchanges: topExchanges
+    };
+  } catch (error) {
+    return {
+      available: false,
+      reason: 'fallback-network-error',
+      message: error instanceof Error ? error.message : 'Unknown CoinGecko ticker error',
+      exchanges: [],
+      source: 'coingecko'
+    };
+  }
+}
+
+async function fetchExchangeAvailability(token, apiKey) {
+  const cmcResult = token?.id ? await fetchCmcMarketPairs(token.id, apiKey) : null;
+
+  if (cmcResult?.available && cmcResult.exchanges?.length) {
+    return cmcResult;
+  }
+
+  const shouldFallback =
+    !cmcResult ||
+    ['missing-id', 'missing-api-key', 'no-exchanges', 'unauthorized', 'http-error', 'network-error', 'rate-limited'].includes(cmcResult.reason);
+
+  if (!shouldFallback) {
+    return cmcResult;
+  }
+
+  const coingeckoResult = await fetchCoingeckoMarketPairs(token);
+
+  if (coingeckoResult.available && coingeckoResult.exchanges?.length) {
+    return coingeckoResult;
+  }
+
+  if (cmcResult) {
+    return cmcResult;
+  }
+
+  return coingeckoResult;
+}
+
 export async function GET() {
   const apiKey = process.env.CMC_API_KEY;
   if (!apiKey) {
@@ -302,6 +645,7 @@ export async function GET() {
 
     const pushshiftToken = process.env.PUSHSHIFT_TOKEN;
     let cachedFailure = null;
+    let exchangeFailure = null;
 
     const tokensWithSentiment = [];
     for (let index = 0; index < filtered.length; index += 1) {
@@ -323,9 +667,28 @@ export async function GET() {
         }
       }
 
+      let marketAccess;
+      if (exchangeFailure) {
+        marketAccess = exchangeFailure;
+      } else if (index >= MAX_EXCHANGE_TOKENS) {
+        marketAccess = {
+          available: false,
+          reason: 'quota',
+          message: 'Exchange lookup limited to top tokens to respect rate limits',
+          exchanges: []
+        };
+      } else {
+        marketAccess = await fetchExchangeAvailability(token, apiKey);
+        if (!marketAccess.available && !['no-exchanges', 'missing-id', 'fallback-no-match', 'fallback-no-exchanges', 'fallback-missing-identifiers'].includes(marketAccess.reason)) {
+          exchangeFailure = marketAccess; // reuse failure for subsequent tokens to avoid repeated errors
+        }
+      }
+
       tokensWithSentiment.push({
         ...token,
         sentiment,
+        marketAccess,
+        exchanges: marketAccess.exchanges ?? [],
         lastUpdated: new Date().toISOString()
       });
     }

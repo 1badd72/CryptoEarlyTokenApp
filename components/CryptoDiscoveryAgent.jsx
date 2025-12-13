@@ -1,4 +1,4 @@
-﻿'use client';
+'use client';
 
 import Image from 'next/image';
 import React, { useCallback, useEffect, useRef, useState } from 'react';
@@ -36,6 +36,32 @@ const formatSentimentSummary = (sentiment) => {
   if (!sentiment.available) return sentiment.message || 'Sentiment unavailable';
   if (!sentiment.commentCount) return 'No recent chatter';
   return `${sentiment.redditScore}/10 - ${sentiment.trend}`;
+};
+
+const getExchangeSourceLabel = (source, mode = 'full') => {
+  if (!source) return '';
+  const normalized = String(source).toLowerCase();
+  if (mode === 'short') {
+    if (normalized === 'coinmarketcap') return 'CMC';
+    if (normalized === 'coingecko') return 'CG';
+    return normalized.toUpperCase();
+  }
+  if (normalized === 'coinmarketcap') return 'CoinMarketCap';
+  if (normalized === 'coingecko') return 'CoinGecko';
+  return source;
+};
+
+const formatExchangeSummary = (exchanges, source, max = 2) => {
+  if (!Array.isArray(exchanges) || !exchanges.length) return '';
+  const names = exchanges
+    .map((entry) => entry?.name)
+    .filter(Boolean);
+  if (!names.length) return '';
+  const shown = names.slice(0, max);
+  const remaining = names.length - shown.length;
+  const summary = remaining > 0 ? `${shown.join(', ')} +${remaining}` : shown.join(', ');
+  const shortLabel = getExchangeSourceLabel(source, 'short');
+  return shortLabel ? `${summary} (${shortLabel})` : summary;
 };
 
 const getSentimentColor = (sentiment) => {
@@ -373,6 +399,11 @@ function Dashboard({ modules, newListings, formatPrice, formatNumber, getScoreBg
                         )}
                       </div>
                       <p className="text-sm text-gray-400">{token.name}</p>
+                      {token.exchanges?.length ? (
+                        <p className="text-xs text-gray-500">Exchanges: {formatExchangeSummary(token.exchanges, token.marketAccess?.source)}</p>
+                      ) : token.marketAccess?.message && token.marketAccess.reason !== 'quota' ? (
+                        <p className="text-xs text-gray-600">{token.marketAccess.message}</p>
+                      ) : null}
                       <p className={`text-xs font-semibold ${getSentimentColor(token.sentiment)}`}>{formatSentimentSummary(token.sentiment)}</p>
                     </div>
                   </div>
@@ -417,7 +448,7 @@ function Tokens({ newListings, formatPrice, formatNumber, getScoreBg, getScoreCo
                   </div>
                   <p className="text-gray-400">{token.name}</p>
                   <p className="text-sm text-gray-500 mt-1">
-                    {token.daysListed ? `Listed ${token.daysListed} day${token.daysListed === 1 ? '' : 's'} ago` : 'Listing date unavailable'} - Rank #{token.marketCapRank || '—'}
+                    {token.daysListed ? `Listed ${token.daysListed} day${token.daysListed === 1 ? '' : 's'} ago` : 'Listing date unavailable'} - Rank #{token.marketCapRank || '—'}{token.exchanges?.length ? ` | ${token.exchanges.length} exchanges` : ''}
                   </p>
                 </div>
               </div>
@@ -472,6 +503,38 @@ function Tokens({ newListings, formatPrice, formatNumber, getScoreBg, getScoreCo
               <KV label="Risk" value={token.analysis?.risk} />
               <KV label="Momentum" value={token.analysis?.momentum} />
               <KV label="Age" value={token.analysis?.age ? `${token.analysis.age} days` : '—'} />
+            </Panel>
+
+            <Panel title="Exchange Coverage" icon={Database}>
+              {token.exchanges?.length ? (
+                <div className="space-y-2 text-sm text-gray-300">
+                  {token.marketAccess?.source ? (
+                    <p className="text-[11px] uppercase tracking-wide text-gray-500">
+                      Source: {getExchangeSourceLabel(token.marketAccess.source)}
+                    </p>
+                  ) : null}
+                  {token.exchanges.slice(0, 6).map((exchange) => {
+                    const volume = typeof exchange.volume24h === 'number' && exchange.volume24h > 0 ? formatNumber(exchange.volume24h) : null;
+                    const categoryLabel = exchange.category ? exchange.category.toUpperCase() : '--';
+                    return (
+                      <div key={exchange.name} className="flex justify-between gap-3">
+                        <span className="font-semibold text-white">{exchange.name}</span>
+                        <span className="text-xs text-gray-400">
+                          {categoryLabel}{volume ? ` | ${volume}` : ''}
+                        </span>
+                      </div>
+                    );
+                  })}
+                  {token.exchanges.length > 6 ? (
+                    <p className="text-[11px] text-gray-500">+{token.exchanges.length - 6} more exchanges tracked</p>
+                  ) : null}
+                </div>
+              ) : (
+                <p className="text-xs text-gray-400">
+                  {token.marketAccess?.message || 'Exchange data currently unavailable'}
+                  {token.marketAccess?.source ? ` (${getExchangeSourceLabel(token.marketAccess.source, 'short')})` : ''}
+                </p>
+              )}
             </Panel>
 
             {token.sentiment?.sampleComments?.length ? (
