@@ -6,6 +6,7 @@ const MAX_EXCHANGE_TOKENS = 20; // limit exchange lookups to avoid rate issues
 
 const COINGECKO_SEARCH_URL = 'https://api.coingecko.com/api/v3/search';
 const COINGECKO_TICKERS_URL = 'https://api.coingecko.com/api/v3/coins';
+const COINGECKO_MARKETS_URL = 'https://api.coingecko.com/api/v3/coins/markets';
 
 const positiveWords = new Set([
   'bull', 'bullish', 'rocket', 'moon', 'moonshot', 'gain', 'gains', 'pump', 'strong', 'undervalued',
@@ -577,21 +578,17 @@ async function fetchExchangeAvailability(token, apiKey) {
 }
 
 export async function GET() {
-  const apiKey = process.env.CMC_API_KEY;
-  if (!apiKey) {
-    return new Response(JSON.stringify({ error: 'Missing CMC_API_KEY env var' }), { status: 500 });
-  }
-
   try {
-    const url = new URL(CMC_URL);
-    url.searchParams.set('sort', 'date_added');
-    url.searchParams.set('sort_dir', 'desc');
-    url.searchParams.set('limit', '150');
-    url.searchParams.set('convert', 'USD');
+    const url = new URL(COINGECKO_MARKETS_URL);
+    url.searchParams.set('vs_currency', 'usd');
+    url.searchParams.set('order', 'volume_desc');
+    url.searchParams.set('per_page', '150');
+    url.searchParams.set('page', '1');
+    url.searchParams.set('sparkline', 'false');
+    url.searchParams.set('price_change_percentage', '1h,24h,7d');
 
     const res = await fetch(url.toString(), {
       headers: {
-        'X-CMC_PRO_API_KEY': apiKey,
         Accept: 'application/json'
       },
       cache: 'no-store'
@@ -599,21 +596,30 @@ export async function GET() {
 
     if (!res.ok) {
       const text = await res.text();
-      return new Response(JSON.stringify({ error: `CMC error ${res.status}: ${text}` }), { status: 502 });
+      return new Response(JSON.stringify({ error: `CoinGecko API error: ${res.status} ${text}` }), { status: 500 });
     }
 
-    const { data } = await res.json();
+    const data = await res.json();
     const now = Date.now();
 
     const baseTokens = (data || []).map((c) => {
-      const quote = c.quote?.USD || {};
-      const dateAdded = c.date_added ? new Date(c.date_added) : null;
-      const daysListed = dateAdded ? Math.max(1, Math.floor((now - dateAdded.getTime()) / (1000 * 60 * 60 * 24))) : null;
-      const mcap = Number(quote.market_cap ?? 0);
-      const vol = Number(quote.volume_24h ?? 0);
-      const pct1h = Number(quote.percent_change_1h ?? 0);
-      const pct24h = Number(quote.percent_change_24h ?? 0);
-      const pct7d = Number(quote.percent_change_7d ?? 0);
+      const quote = {
+        USD: {
+          market_cap: c.market_cap,
+          volume_24h: c.total_volume,
+          percent_change_1h: c.price_change_percentage_1h_in_currency?.usd || 0,
+          percent_change_24h: c.price_change_percentage_24h_in_currency?.usd || 0,
+          percent_change_7d: c.price_change_percentage_7d_in_currency?.usd || 0,
+          price: c.current_price
+        }
+      };
+      const dateAdded = null; // CoinGecko doesn't provide listing date
+      const daysListed = null; // Treat all as potentially early
+      const mcap = Number(quote.USD.market_cap ?? 0);
+      const vol = Number(quote.USD.volume_24h ?? 0);
+      const pct1h = Number(quote.USD.percent_change_1h ?? 0);
+      const pct24h = Number(quote.USD.percent_change_24h ?? 0);
+      const pct7d = Number(quote.USD.percent_change_7d ?? 0);
 
       const score = normalizeScore({ mcap, vol, pct24h, pct7d, daysListed: daysListed ?? 30 });
       const volumeRatio = mcap > 0 ? (vol / mcap) * 100 : 0;
@@ -621,11 +627,12 @@ export async function GET() {
       return {
         id: c.id,
         symbol: (c.symbol || '').toUpperCase(),
-        slug: c.slug,
+        slug: c.id, // CoinGecko uses id as slug
         name: c.name,
         image: `https://robohash.org/${encodeURIComponent(c.symbol || '')}.png?size=80x80&set=set1`,
+        date_added: null,
         score,
-        price: Number(quote.price ?? 0),
+        price: Number(quote.USD.price ?? 0),
         marketCap: mcap,
         volume24h: vol,
         volumeMarketCapRatio: Number(volumeRatio.toFixed(2)),
@@ -643,29 +650,14 @@ export async function GET() {
       .sort((a, b) => b.score - a.score)
       .slice(0, 60);
 
-    const pushshiftToken = process.env.PUSHSHIFT_TOKEN;
-    let cachedFailure = null;
-    let exchangeFailure = null;
-
     const tokensWithSentiment = [];
     for (let index = 0; index < filtered.length; index += 1) {
       const token = filtered[index];
-      let sentiment;
-
-      if (cachedFailure) {
-        sentiment = cachedFailure;
-      } else if (index >= MAX_SENTIMENT_TOKENS) {
-        sentiment = {
-          available: false,
-          reason: 'quota',
-          message: 'Sentiment limited to top tokens to respect rate limits'
-        };
-      } else {
-        sentiment = await fetchRedditMetrics(token.symbol, pushshiftToken);
-        if (!sentiment.available && sentiment.reason !== 'no-comments' && sentiment.reason !== 'missing-symbol') {
-          cachedFailure = sentiment; // reuse failure for subsequent tokens to avoid repeated errors
-        }
-      }
+      const sentiment = {
+        available: false,
+        reason: 'disabled',
+        message: 'Reddit sentiment removed for free API'
+      };
 
       let marketAccess;
       if (exchangeFailure) {
