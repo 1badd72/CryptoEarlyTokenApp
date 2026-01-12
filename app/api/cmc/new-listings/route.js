@@ -1,26 +1,13 @@
 ﻿const CMC_URL = 'https://pro-api.coinmarketcap.com/v1/cryptocurrency/listings/latest';
 const CMC_MARKET_PAIRS_URL = 'https://pro-api.coinmarketcap.com/v1/cryptocurrency/market-pairs/latest';
-const PUSHSHIFT_URL = 'https://api.pushshift.io/reddit/comment/search';
-const MAX_SENTIMENT_TOKENS = 25; // stay well under Pushshift rate guidance
+const MAX_SENTIMENT_TOKENS = 25; // keep social lookups under rate limits
 const MAX_EXCHANGE_TOKENS = 20; // limit exchange lookups to avoid rate issues
 
 const COINGECKO_SEARCH_URL = 'https://api.coingecko.com/api/v3/search';
 const COINGECKO_TICKERS_URL = 'https://api.coingecko.com/api/v3/coins';
 const COINGECKO_MARKETS_URL = 'https://api.coingecko.com/api/v3/coins/markets';
 
-const positiveWords = new Set([
-  'bull', 'bullish', 'rocket', 'moon', 'moonshot', 'gain', 'gains', 'pump', 'strong', 'undervalued',
-  'opportunity', 'breakout', 'green', 'surge', 'up', 'winner', 'diamond', 'solid'
-]);
-
-const negativeWords = new Set([
-  'bear', 'bearish', 'dump', 'scam', 'rug', 'down', 'bleed', 'crash', 'sell', 'selling', 'bag', 'risk',
-  'exit', 'concern', 'problem', 'red', 'collapse', 'liquidate'
-]);
-
 const clamp = (value, min, max) => Math.min(Math.max(value, min), max);
-
-const hoursToMs = (hrs) => hrs * 60 * 60 * 1000;
 
 function normalizeScore({ mcap, vol, pct24h, pct7d, daysListed }) {
   const ratio = mcap > 0 ? vol / mcap : 0;
@@ -67,146 +54,55 @@ function classifyAnalysis({ mcap, vol, pct24h, pct7d, score, daysListed }) {
   };
 }
 
-function tokenize(text) {
-  return (text || '')
-    .toLowerCase()
-    .replace(/[^a-z0-9\s]/gi, ' ')
-    .split(/\s+/)
-    .filter(Boolean);
+function normalizeSentimentScore(value) {
+  if (!Number.isFinite(value)) return null;
+  return Number((clamp(value, 0, 100) / 10).toFixed(2));
 }
 
-function analyzeComments(comments) {
-  if (!comments.length) {
-    return {
-      available: false,
-      reason: 'no-comments',
-      message: 'No recent Reddit chatter',
-      commentCount: 0,
-      positiveRatio: 0,
-      negativeRatio: 0,
-      trend: 'No recent chatter',
-      topSubreddits: [],
-      sampleComments: []
-    };
-  }
-
-  let positive = 0;
-  let negative = 0;
-  let aggregate = 0;
-  let recentCount = 0;
-  const now = Date.now();
-  const sixHoursAgo = now - hoursToMs(6);
-  const subreddits = new Map();
-
-  const sampleComments = [];
-
-  comments.forEach((comment) => {
-    const body = comment?.body || '';
-    const tokens = tokenize(body);
-    let sentimentScore = 0;
-    tokens.forEach((word) => {
-      if (positiveWords.has(word)) sentimentScore += 1;
-      else if (negativeWords.has(word)) sentimentScore -= 1;
-    });
-
-    if (sentimentScore > 0) positive += 1;
-    if (sentimentScore < 0) negative += 1;
-    aggregate += sentimentScore;
-
-    const createdUtc = comment?.created_utc ? Number(comment.created_utc) * 1000 : null;
-    if (createdUtc && createdUtc >= sixHoursAgo) {
-      recentCount += 1;
-    }
-
-    const subreddit = comment?.subreddit?.toLowerCase();
-    if (subreddit) {
-      subreddits.set(subreddit, (subreddits.get(subreddit) || 0) + 1);
-    }
-
-    if (sampleComments.length < 3 && body.trim().length > 10) {
-      sampleComments.push({
-        body: body.slice(0, 160),
-        score: comment?.score ?? null,
-        subreddit: comment?.subreddit ?? null
-      });
-    }
-  });
-
-  const commentCount = comments.length;
-  const avg = commentCount ? aggregate / commentCount : 0;
-  const normalized = clamp(((avg + 5) / 10) * 10, 0, 10);
-  const positiveRatio = commentCount ? (positive / commentCount) * 100 : 0;
-  const negativeRatio = commentCount ? (negative / commentCount) * 100 : 0;
-  const recencyRatio = commentCount ? recentCount / commentCount : 0;
-
-  let trend = 'Cooling';
-  if (recencyRatio >= 0.6) trend = 'Heating up';
-  else if (recencyRatio >= 0.3) trend = 'Steady';
-
-  const topSubreddits = Array.from(subreddits.entries())
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 3)
-    .map(([name, count]) => ({ name, count }));
-
-  return {
-    available: true,
-    redditScore: Number(normalized.toFixed(2)),
-    commentCount,
-    positiveRatio: Number(positiveRatio.toFixed(1)),
-    negativeRatio: Number(negativeRatio.toFixed(1)),
-    trend,
-    topSubreddits,
-    sampleComments
-  };
+function deriveActivityCount(communityData) {
+  const avgPosts48h = Number(communityData?.reddit_average_posts_48h ?? 0);
+  const avgComments48h = Number(communityData?.reddit_average_comments_48h ?? 0);
+  const activeAccounts48h = Number(communityData?.reddit_accounts_active_48h ?? 0);
+  const scaledActivity = (avgPosts48h + avgComments48h) * 3.5;
+  const candidate = Math.max(scaledActivity, activeAccounts48h / 2);
+  return Number.isFinite(candidate) ? Math.round(candidate) : 0;
 }
 
-async function fetchRedditMetrics(symbol, token) {
-  if (!symbol) {
+function classifySocialTrend(score, activityCount) {
+  if (activityCount >= 200 || (score !== null && score >= 7.5)) return 'Heating up';
+  if (activityCount >= 60 || (score !== null && score >= 6)) return 'Steady';
+  if (activityCount >= 10 || (score !== null && score >= 4.5)) return 'Cooling';
+  return 'Low activity';
+}
+
+async function fetchCoingeckoSentiment(token) {
+  if (!token?.slug) {
     return {
       available: false,
-      reason: 'missing-symbol',
-      message: 'Symbol missing for sentiment lookup'
+      reason: 'missing-id',
+      message: 'CoinGecko ID missing for sentiment lookup'
     };
   }
 
-  if (!token) {
-    return {
-      available: false,
-      reason: 'missing-token',
-      message: 'Pushshift token not provided'
-    };
-  }
-
-  const url = new URL(PUSHSHIFT_URL);
-  url.searchParams.set('sort', 'created_utc');
-  url.searchParams.set('order', 'desc');
-  url.searchParams.set('limit', '50');
-  url.searchParams.set('track_total_hits', 'false');
-  url.searchParams.set('q', symbol);
-  url.searchParams.set('after', '7d');
+  const url = new URL(`${COINGECKO_TICKERS_URL}/${token.slug}`);
+  url.searchParams.set('localization', 'false');
+  url.searchParams.set('tickers', 'false');
+  url.searchParams.set('market_data', 'false');
+  url.searchParams.set('community_data', 'true');
+  url.searchParams.set('developer_data', 'false');
+  url.searchParams.set('sparkline', 'false');
 
   try {
     const res = await fetch(url.toString(), {
-      headers: {
-        Accept: 'application/json',
-        Authorization: `Bearer ${token}`
-      },
+      headers: { Accept: 'application/json' },
       cache: 'no-store'
     });
-
-    if (res.status === 401) {
-      return {
-        available: false,
-        reason: 'unauthorized',
-        message: 'Pushshift token expired or unauthorized. Refresh via moderator OAuth.'
-      };
-    }
 
     if (res.status === 429) {
       return {
         available: false,
         reason: 'rate-limited',
-        message: 'Pushshift rate limit hit. Try again shortly.'
+        message: 'CoinGecko sentiment rate limit hit. Try again shortly.'
       };
     }
 
@@ -215,26 +111,41 @@ async function fetchRedditMetrics(symbol, token) {
       return {
         available: false,
         reason: 'http-error',
-        message: `Pushshift ${res.status}: ${text || 'Unknown error'}`
+        message: `CoinGecko sentiment ${res.status}: ${text || 'Unknown error'}`
       };
     }
 
     const payload = await res.json();
-    const raw = Array.isArray(payload?.data)
-      ? payload.data
-      : Array.isArray(payload?.results)
-        ? payload.results
-        : Array.isArray(payload?.data?.data)
-          ? payload.data.data
-          : [];
+    const up = Number(payload?.sentiment_votes_up_percentage);
+    const down = Number(payload?.sentiment_votes_down_percentage);
+    const score = normalizeSentimentScore(up);
+    const activityCount = deriveActivityCount(payload?.community_data);
+    const trend = classifySocialTrend(score, activityCount);
 
-    const comments = raw.filter((item) => typeof item?.body === 'string');
-    return analyzeComments(comments);
+    if (score === null && activityCount === 0) {
+      return {
+        available: false,
+        reason: 'no-data',
+        message: 'No social sentiment data from CoinGecko'
+      };
+    }
+
+    return {
+      available: true,
+      source: 'coingecko',
+      score,
+      activityCount,
+      positiveRatio: Number.isFinite(up) ? Number(up.toFixed(1)) : 0,
+      negativeRatio: Number.isFinite(down) ? Number(down.toFixed(1)) : 0,
+      trend,
+      topSources: [],
+      sampleMentions: []
+    };
   } catch (error) {
     return {
       available: false,
       reason: 'network-error',
-      message: error instanceof Error ? error.message : 'Unknown Pushshift error'
+      message: error instanceof Error ? error.message : 'Unknown CoinGecko sentiment error'
     };
   }
 }
@@ -570,7 +481,7 @@ async function fetchExchangeAvailability(token, apiKey) {
     return coingeckoResult;
   }
 
-  if (cmcResult) {
+  if (cmcResult && !['missing-api-key', 'unauthorized'].includes(cmcResult.reason)) {
     return cmcResult;
   }
 
@@ -579,6 +490,9 @@ async function fetchExchangeAvailability(token, apiKey) {
 
 export async function GET() {
   try {
+    const apiKey = process.env.CMC_API_KEY || process.env.NEXT_PUBLIC_CMC_API_KEY;
+    let exchangeFailure = null;
+    let sentimentFailure = null;
     const url = new URL(COINGECKO_MARKETS_URL);
     url.searchParams.set('vs_currency', 'usd');
     url.searchParams.set('order', 'volume_desc');
@@ -653,11 +567,21 @@ export async function GET() {
     const tokensWithSentiment = [];
     for (let index = 0; index < filtered.length; index += 1) {
       const token = filtered[index];
-      const sentiment = {
-        available: false,
-        reason: 'disabled',
-        message: 'Reddit sentiment removed for free API'
-      };
+      let sentiment;
+      if (sentimentFailure) {
+        sentiment = sentimentFailure;
+      } else if (index >= MAX_SENTIMENT_TOKENS) {
+        sentiment = {
+          available: false,
+          reason: 'quota',
+          message: 'Sentiment lookup limited to top tokens to respect rate limits'
+        };
+      } else {
+        sentiment = await fetchCoingeckoSentiment(token);
+        if (!sentiment.available && ['rate-limited', 'http-error', 'network-error'].includes(sentiment.reason)) {
+          sentimentFailure = sentiment;
+        }
+      }
 
       let marketAccess;
       if (exchangeFailure) {
